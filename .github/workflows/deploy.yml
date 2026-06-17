@@ -2,44 +2,48 @@ name: CI/CD Pipeline - DevOps EP3
 
 on:
   push:
-    branches: [ "main" ] # Se ejecuta automáticamente tras cada commit o merge a main
+    branches: [ "main" ]
 
 env:
   AWS_REGION: us-east-1                  # Región por defecto de AWS Academy
-  EKS_CLUSTER_NAME: mi-cluster-eks       # El nombre que le des a tu clúster EKS
-  ECR_FRONTEND_REPO: repo-frontend       # Nombre de tu repositorio ECR para el Front
-  ECR_BACKEND_REPO: repo-backend         # Nombre de tu repositorio ECR para el Back
+  EKS_CLUSTER_NAME: devopseks            # El nombre exacto de tu clúster
+  ECR_FRONTEND_REPO: tienda-frontend     # Nombre de tus ECRs según tu proyecto
+  ECR_BACKEND_REPO: tienda-backend
+  ECR_DB_REPO: tienda-db
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-    # 1. Clonar el código del repositorio de GitHub
+    # 1. Clonar el código del repositorio
     - name: Checkout Code
       uses: actions/checkout@v4
 
     # 2. Configurar las credenciales de AWS Academy (Dinámicas)
-    # NOTA: Debes guardar estas tres variables en los "Secrets" de tu repositorio de GitHub
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }} # Obligatorio para AWS Academy
+        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
         aws-region: ${{ env.AWS_REGION }}
 
-    # 3. Autenticarse en Amazon ECR (Elastic Container Registry)
+    # 3. Autenticarse en Amazon ECR
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
-    # 4. Construir las imágenes Docker, etiquetarlas y subirlas (Push) a Amazon ECR
+    # 4. Construir las imágenes Docker y subirlas a ECR (¡Incluyendo la DB!)
     - name: Build, Tag, and Push Images to Amazon ECR
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        IMAGE_TAG: ${{ github.sha }} # Usa el hash del commit como etiqueta única
+        IMAGE_TAG: eks-v1 # Forzamos el tag que tus archivos k8s esperan leer
       run: |
+        # ---- DATABASE ----
+        docker build -t $ECR_REGISTRY/${{ env.ECR_DB_REPO }}:$IMAGE_TAG ./db
+        docker push $ECR_REGISTRY/${{ env.ECR_DB_REPO }}:$IMAGE_TAG
+
         # ---- BACKEND ----
         docker build -t $ECR_REGISTRY/${{ env.ECR_BACKEND_REPO }}:$IMAGE_TAG ./backend
         docker push $ECR_REGISTRY/${{ env.ECR_BACKEND_REPO }}:$IMAGE_TAG
@@ -48,41 +52,44 @@ jobs:
         docker build -t $ECR_REGISTRY/${{ env.ECR_FRONTEND_REPO }}:$IMAGE_TAG ./frontend
         docker push $ECR_REGISTRY/${{ env.ECR_FRONTEND_REPO }}:$IMAGE_TAG
         
-        # Guardar el tag para el siguiente paso de despliegue
-        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
         echo "ECR_REGISTRY=$ECR_REGISTRY" >> $GITHUB_ENV
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
 
-    # 5. Configurar el archivo kubeconfig para conectarse a AWS EKS
+    # 5. Configurar kubeconfig para conectarse a AWS EKS
     - name: Update Kubeconfig for EKS
       run: |
         aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
 
-    # 6. Desplegar de forma actualizada en Kubernetes (EKS) aplicando los manifiestos
+    # 6. Desplegar aplicando manifiestos e instalando el Metrics Server (Exigido en IE3/IE6)
     - name: Deploy to AWS EKS
       run: |
-        # 1. Crear el namespace si no existe (opcional si ya está en tu namespace.yaml)
-        kubectl apply -f k8s/namespace.yaml
+        # Instalar Metrics Server para que funcione el Autoscaling (HPA)
+        kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
         
-        # 2. Aplicar los secretos primero
+        # Crear estructura base
+        kubectl apply -f k8s/namespace.yaml
         kubectl apply -f k8s/mysql-secret.yaml
         
-        # 3. Aplicar base de datos y servicios de red
+        # Reemplazar dinámicamente la URL de ECR en los manifiestos
+        find ./k8s -type f -name "*.yaml" -exec sed -i "s|{{ECR_URL}}|${{ env.ECR_REGISTRY }}|g" {} \;
+        
+        # Desplegar componentes en orden
         kubectl apply -f k8s/mysql-deployment.yaml
         kubectl apply -f k8s/mysql-service.yaml
+        kubectl apply -f k8s/backend-deployment.yaml
         kubectl apply -f k8s/backend-service.yaml
+        kubectl apply -f k8s/frontend-deployment.yaml
         kubectl apply -f k8s/frontend-service.yaml
         
-        # 4. Inyectar dinámicamente las imágenes recién compiladas desde ECR a los manifiestos de despliegue
-        cat k8s/backend-deployment.yaml | sed "s|image:.*|image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_BACKEND_REPO }}:${{ env.IMAGE_TAG }}|g" | kubectl apply -f -
-        cat k8s/frontend-deployment.yaml | sed "s|image:.*|image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_FRONTEND_REPO }}:${{ env.IMAGE_TAG }}|g" | kubectl apply -f -
-        
-        # 5. Aplicar políticas de Autoscaling (HPA)
+        # Aplicar Autoscaling (IE3)
         kubectl apply -f k8s/backend-hpa.yaml
         kubectl apply -f k8s/frontend-hpa.yaml
 
-    # 7. Verificar el estado del despliegue (Crítico para la sección de métricas/logs)
+    # 7. Verificar el estado del despliegue (Namespace: tienda)
     - name: Verify Deployment Status
       run: |
-        kubectl rollout status deployment/backend-deployment -n <tu-namespace>
-        kubectl rollout status deployment/frontend-deployment -n <tu-namespace>
-        kubectl get pods -n <tu-namespace>
+        kubectl rollout status deployment/tienda-db -n tienda --timeout=120s
+        kubectl rollout status deployment/tienda-backend -n tienda --timeout=120s
+        kubectl rollout status deployment/tienda-frontend -n tienda --timeout=120s
+        kubectl get pods -n tienda
+        kubectl get svc -n tienda
